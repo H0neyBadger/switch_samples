@@ -1,0 +1,120 @@
+diff --git a/scripts/switch/build.sh b/scripts/switch/build.sh
+index fb8bf6f..7d59b39 100755
+--- a/scripts/switch/build.sh
++++ b/scripts/switch/build.sh
+@@ -32,6 +32,8 @@ build_chiaki (){
+       -DCHIAKI_ENABLE_SWITCH_LINUX="${CHIAKI_ENABLE_SWITCH_LINUX}" \
+       -DCHIAKI_LIB_ENABLE_MBEDTLS=ON
+ 
++#-DCMAKE_CXX_FLAGS="-pg"
++
+     pushd "${BASEDIR}/${build}/switch/"
+       make
+     popd
+diff --git a/switch/include/host.h b/switch/include/host.h
+index c7b2cba..0c865f9 100644
+--- a/switch/include/host.h
++++ b/switch/include/host.h
+@@ -81,8 +81,9 @@ class Host
+ 		ChiakiControllerState keyboard_state;
+ 		unsigned int audio_buffer_size;
+ 		// share video from main loop and host obj
+-		AVCodec *codec;
+-		AVCodecContext *codec_context;
++		AVCodec *codec = nullptr;
++		AVCodecContext *codec_context = nullptr;
++		AVBufferRef *hw_device_ctx = nullptr;
+ 		struct SwsContext * sws_context = NULL;
+ 		// audio vars
+ 		SDL_AudioDeviceID audio_device_id;
+diff --git a/switch/src/host.cpp b/switch/src/host.cpp
+index 71bdf74..4ee4361 100644
+--- a/switch/src/host.cpp
++++ b/switch/src/host.cpp
+@@ -60,8 +60,9 @@ void Host::InitVideo(){
+ 	// set libav video context
+ 	// for later stream
+ 
+-	int numBytes;
++	int buffer_size;
+ 	uint8_t * buffer = NULL;
++	this->hw_device_ctx = nullptr;
+ 	this->codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+ 	if(!this->codec)
+ 		throw Exception("H264 Codec not available");
+@@ -69,10 +70,41 @@ void Host::InitVideo(){
+ 	this->codec_context = avcodec_alloc_context3(codec);
+ 	if(!this->codec_context)
+ 		throw Exception("Failed to alloc codec context");
+-
++/*
++	// none vaapi or vdpau
++	// AV_HWDEVICE_TYPE_NONE
++	// AV_HWDEVICE_TYPE_VDPAU
++	// AV_HWDEVICE_TYPE_CUDA
++	// AV_HWDEVICE_TYPE_VAAPI
++	// AV_HWDEVICE_TYPE_DXVA2
++	// AV_HWDEVICE_TYPE_QSV
++	// AV_HWDEVICE_TYPE_VIDEOTOOLBOX
++	// AV_HWDEVICE_TYPE_D3D11VA
++	// AV_HWDEVICE_TYPE_DRM
++	// AV_HWDEVICE_TYPE_OPENCL
++	// AV_HWDEVICE_TYPE_MEDIACODEC
++	AVHWDeviceType type = av_hwdevice_find_type_by_name("none");
++	if (type == AV_HWDEVICE_TYPE_NONE)
++		throw Exception("Can't initialize vaapi");
++	for(int i = 0;; i++) {
++		const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
++		if(!config)
++			throw Exception("avcodec_get_hw_config failed");
++
++		if(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
++			config->device_type == type) {
++
++			hw_pix_fmt = AV_PIX_FMT_YUV420P;
++			break;
++			}
++	}
++	if(av_hwdevice_ctx_create(&this->hw_device_ctx, type, NULL, NULL, 0) < 0)
++	throw Exception("Failed to create hwdevice context");
++	this->codec_context->hw_device_ctx = av_buffer_ref(this->hw_device_ctx);
++	*/
+ 	if(avcodec_open2(codec_context, codec, nullptr) < 0)
+ 	{
+-		avcodec_free_context(&codec_context);
++		avcodec_free_context(&this->codec_context);
+ 		throw Exception("Failed to open codec context");
+ 	}
+ /*
+@@ -109,6 +141,7 @@ void Host::InitVideo(){
+ 	this->codec_context->width = 1280;
+ 	this->codec_context->height = 720;
+ 	this->codec_context->pix_fmt = AV_PIX_FMT_YUV420P;
++	this->codec_context->thread_count = 6;
+ 	// sws context to convert frame data to YUV420:
+ 	// {"width":1280,"height":720}
+ 	// AV_PIX_FMT_BGR24
+@@ -120,20 +153,20 @@ void Host::InitVideo(){
+ 		this->codec_context->width,
+ 		this->codec_context->height,
+ 		AV_PIX_FMT_YUV420P,
+-		SWS_BILINEAR,
++		SWS_POINT,
+ 		NULL,
+ 		NULL,
+ 		NULL
+ 	);
+ 
+-	numBytes = av_image_get_buffer_size(
++	buffer_size = av_image_get_buffer_size(
+ 		AV_PIX_FMT_YUV420P,
+ 		this->codec_context->width,
+ 		this->codec_context->height,
+ 		32
+ 	);
+ 
+-	buffer = (uint8_t *) av_malloc(numBytes * sizeof(uint8_t));
++	buffer = (uint8_t *) av_malloc(buffer_size * sizeof(uint8_t));
+ 
+ 	this->pict = av_frame_alloc();
+ 

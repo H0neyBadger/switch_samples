@@ -1,0 +1,183 @@
+diff --git a/lib/include/chiaki/gkcrypt.h b/lib/include/chiaki/gkcrypt.h
+index a2c76e7..eab1fb6 100644
+--- a/lib/include/chiaki/gkcrypt.h
++++ b/lib/include/chiaki/gkcrypt.h
+@@ -37,6 +37,7 @@ extern "C" {
+ 
+ typedef struct chiaki_gkcrypt_t {
+ 	uint8_t index;
++	pthread_barrier_t *thread_barrier;
+ 
+ 	uint8_t *key_buf; // circular buffer of the ctr mode key stream
+ 	size_t key_buf_size;
+@@ -62,7 +63,7 @@ struct chiaki_session_t;
+ /**
+  * @param key_buf_chunks if > 0, use a thread to generate the ctr mode key stream
+  */
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret);
++CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret, pthread_barrier_t *thread_barrier);
+ 
+ CHIAKI_EXPORT void chiaki_gkcrypt_fini(ChiakiGKCrypt *gkcrypt);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_gen_key_stream(ChiakiGKCrypt *gkcrypt, size_t key_pos, uint8_t *buf, size_t buf_size);
+@@ -74,12 +75,12 @@ CHIAKI_EXPORT void chiaki_gkcrypt_gen_new_gmac_key(ChiakiGKCrypt *gkcrypt, uint6
+ CHIAKI_EXPORT void chiaki_gkcrypt_gen_tmp_gmac_key(ChiakiGKCrypt *gkcrypt, uint64_t index, uint8_t *key_out);
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_gmac(ChiakiGKCrypt *gkcrypt, size_t key_pos, const uint8_t *buf, size_t buf_size, uint8_t *gmac_out);
+ 
+-static inline ChiakiGKCrypt *chiaki_gkcrypt_new(ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret)
++static inline ChiakiGKCrypt *chiaki_gkcrypt_new(ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret, pthread_barrier_t *gkcrypt_thread_barrier)
+ {
+ 	ChiakiGKCrypt *gkcrypt = CHIAKI_NEW(ChiakiGKCrypt);
+ 	if(!gkcrypt)
+ 		return NULL;
+-	ChiakiErrorCode err = chiaki_gkcrypt_init(gkcrypt, log, key_buf_chunks, index, handshake_key, ecdh_secret);
++	ChiakiErrorCode err = chiaki_gkcrypt_init(gkcrypt, log, key_buf_chunks, index, handshake_key, ecdh_secret, gkcrypt_thread_barrier);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		free(gkcrypt);
+diff --git a/lib/include/chiaki/streamconnection.h b/lib/include/chiaki/streamconnection.h
+index c8f2bea..6b421ef 100644
+--- a/lib/include/chiaki/streamconnection.h
++++ b/lib/include/chiaki/streamconnection.h
+@@ -40,6 +40,7 @@ typedef struct chiaki_stream_connection_t
+ 	uint8_t *ecdh_secret;
+ 	ChiakiGKCrypt *gkcrypt_local;
+ 	ChiakiGKCrypt *gkcrypt_remote;
++	pthread_barrier_t gkcrypt_thread_barrier;
+ 
+ 	ChiakiFeedbackSender feedback_sender;
+ 	/**
+diff --git a/lib/src/gkcrypt.c b/lib/src/gkcrypt.c
+index 46af4e7..f967b9a 100644
+--- a/lib/src/gkcrypt.c
++++ b/lib/src/gkcrypt.c
+@@ -44,10 +44,11 @@ static ChiakiErrorCode gkcrypt_gen_key_iv(ChiakiGKCrypt *gkcrypt, uint8_t index,
+ 
+ static void *gkcrypt_thread_func(void *user);
+ 
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret)
++CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, ChiakiLog *log, size_t key_buf_chunks, uint8_t index, const uint8_t *handshake_key, const uint8_t *ecdh_secret, pthread_barrier_t *thread_barrier)
+ {
+ 	gkcrypt->log = log;
+ 	gkcrypt->index = index;
++	gkcrypt->thread_barrier = thread_barrier;
+ 
+ 	gkcrypt->key_buf_size = key_buf_chunks * KEY_BUF_CHUNK_SIZE;
+ 	gkcrypt->key_buf_populated = 0;
+@@ -59,7 +60,6 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
+ 	ChiakiErrorCode err;
+ 	if(gkcrypt->key_buf_size)
+ 	{
+-		TRACE("chiaki_aligned_alloc");
+ 		gkcrypt->key_buf = chiaki_aligned_alloc(KEY_BUF_CHUNK_SIZE, gkcrypt->key_buf_size);
+ 		if(!gkcrypt->key_buf)
+ 		{
+@@ -67,12 +67,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
+ 			goto error;
+ 		}
+ 
+-		TRACE("chiaki_mutex_init");
+ 		err = chiaki_mutex_init(&gkcrypt->key_buf_mutex, false);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			goto error_key_buf;
+ 
+-		TRACE("chiaki_mutex_init");
+ 		err = chiaki_cond_init(&gkcrypt->key_buf_cond);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			goto error_key_buf_mutex;
+@@ -81,7 +79,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
+ 	{
+ 		gkcrypt->key_buf = NULL;
+ 	}
+-	TRACE("gen key iv");
++	sleep(1);
+ 	err = gkcrypt_gen_key_iv(gkcrypt, index, handshake_key, ecdh_secret);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+@@ -89,7 +87,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
+ 		goto error_key_buf_cond;
+ 	}
+ 
+-	TRACE("gen gmac key");
++	sleep(1);
+ 	chiaki_gkcrypt_gen_gmac_key(0, gkcrypt->key_base, gkcrypt->iv, gkcrypt->key_gmac_base);
+ 	gkcrypt->key_gmac_index_current = 0;
+ 	memcpy(gkcrypt->key_gmac_current, gkcrypt->key_gmac_base, sizeof(gkcrypt->key_gmac_current));
+@@ -506,22 +504,18 @@ static ChiakiErrorCode gkcrypt_generate_next_chunk(ChiakiGKCrypt *gkcrypt)
+ 
+ static void *gkcrypt_thread_func(void *user)
+ {
+-	TRACE("hello from thread function user %p", user);
+-	sleep(1);
+ 	ChiakiGKCrypt *gkcrypt = user;
+ 	CHIAKI_LOGV(gkcrypt->log, "GKCrypt %d thread starting", (int)gkcrypt->index);
++	sleep(1);
++	printf("wait barrier\n");
++	pthread_barrier_wait(gkcrypt->thread_barrier);
++	printf("wait barrier end \n");
+ 
+-	TRACE("Mutex thread lock %d",(int)gkcrypt->index);
+ 	ChiakiErrorCode err = chiaki_mutex_lock(&gkcrypt->key_buf_mutex);
+-	TRACE("Mutex thread lock end %d",(int)gkcrypt->index);
+ 	assert(err == CHIAKI_ERR_SUCCESS);
+-	int loop =0;
+ 	while(1)
+ 	{
+-		loop++;
+-		TRACE("thread wait pred %d:%d",(int)gkcrypt->index, loop);
+ 		err = chiaki_cond_wait_pred(&gkcrypt->key_buf_cond, &gkcrypt->key_buf_mutex, key_buf_mutex_pred, gkcrypt);
+-		TRACE("thread wait pred %d:%d",(int)gkcrypt->index, loop);
+ 
+ 		if(gkcrypt->key_buf_thread_stop || err != CHIAKI_ERR_SUCCESS)
+ 			break;
+@@ -551,13 +545,11 @@ static void *gkcrypt_thread_func(void *user)
+ 			gkcrypt->key_buf_key_pos_min += KEY_BUF_CHUNK_SIZE;
+ 			gkcrypt->key_buf_populated -= KEY_BUF_CHUNK_SIZE;
+ 		}
+-		TRACE("gkcrypt_generate_next_chunk %d:%d",(int)gkcrypt->index, loop);
+ 		err = gkcrypt_generate_next_chunk(gkcrypt);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 			break;
+ 	}
+ 
+ 	chiaki_mutex_unlock(&gkcrypt->key_buf_mutex);
+-	TRACE("Mutex unlock %d:%d",(int)gkcrypt->index, loop);
+ 	return NULL;
+ }
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index fde546c..7e1deb1 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -114,6 +114,8 @@ CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_
+ 	chiaki_gkcrypt_free(stream_connection->gkcrypt_remote);
+ 	chiaki_gkcrypt_free(stream_connection->gkcrypt_local);
+ 
++	pthread_barrier_destroy(&stream_connection->gkcrypt_thread_barrier);
++
+ 	free(stream_connection->ecdh_secret);
+ 
+ 	chiaki_mutex_fini(&stream_connection->feedback_sender_mutex);
+@@ -412,13 +414,22 @@ static ChiakiErrorCode stream_connection_init_crypt(ChiakiStreamConnection *stre
+ {
+ 	ChiakiSession *session = stream_connection->session;
+ 
+-	stream_connection->gkcrypt_local = chiaki_gkcrypt_new(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 2, session->handshake_key, stream_connection->ecdh_secret);
++	pthread_barrier_init(&stream_connection->gkcrypt_thread_barrier, NULL, 2);
++
++	stream_connection->gkcrypt_local = chiaki_gkcrypt_new(stream_connection->log,
++		CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 2, session->handshake_key,
++		stream_connection->ecdh_secret, &stream_connection->gkcrypt_thread_barrier);
++
+ 	if(!stream_connection->gkcrypt_local)
+ 	{
+ 		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to initialize local GKCrypt with index 2");
+ 		return CHIAKI_ERR_UNKNOWN;
+ 	}
+-	stream_connection->gkcrypt_remote = chiaki_gkcrypt_new(stream_connection->log, CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 3, session->handshake_key, stream_connection->ecdh_secret);
++
++	stream_connection->gkcrypt_remote = chiaki_gkcrypt_new(stream_connection->log,
++		CHIAKI_GKCRYPT_KEY_BUF_BLOCKS_DEFAULT, 3, session->handshake_key,
++		stream_connection->ecdh_secret, &stream_connection->gkcrypt_thread_barrier);
++
+ 	if(!stream_connection->gkcrypt_remote)
+ 	{
+ 		CHIAKI_LOGE(stream_connection->log, "StreamConnection failed to initialize remote GKCrypt with index 3");
