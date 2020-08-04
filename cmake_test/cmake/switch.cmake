@@ -1,5 +1,3 @@
-# https://github.com/nxengine/nxengine-evo
-
 # Find DEVKITPRO
 if(NOT DEFINED ENV{DEVKITPRO})
 	message(FATAL_ERROR "You must have defined DEVKITPRO before calling cmake.")
@@ -7,21 +5,12 @@ endif()
 
 set(DEVKITPRO $ENV{DEVKITPRO})
 
+set(ARCH "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec")
+set(CMAKE_C_FLAGS          "${ARCH} -O2 -ffunction-sections -fdata-sections -Wall")
+set(CMAKE_CXX_FLAGS        "${CMAKE_C_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS "-specs=${DEVKITPRO}/libnx/switch.specs")
+set(CMAKE_ASM_FLAGS        "${CMAKE_C_FLAGS}" )
 
-function(switchvar cmakevar var default)
-	# read or set env var
-	if(NOT DEFINED "ENV{$var}")
-		set("ENV{$var}" default)
-	endif()
-	set("$cmakevar" "ENV{$var}")
-endfunction()
-
-# allow gcc -g to use
-# aarch64-none-elf-addr2line -e build/test -f -p -C -a 0xCCB5C
-set(CMAKE_BUILD_TYPE Debug)
-
-# switchvar(CMAKE_CXX_FLAGS CXXFLAGS "${CMAKE_C_FLAGS} -fno-rtti")
-include_directories(${DEVKITPRO}/libnx/include ${PORTLIBS_PREFIX}/include)
 
 find_program(ELF2NRO elf2nro ${DEVKITPRO}/tools/bin)
 if (ELF2NRO)
@@ -64,4 +53,8 @@ function(add_nro_target target title author version icon romfs)
         add_custom_target(${target_we}_nro ALL SOURCES ${CMAKE_CURRENT_BINARY_DIR}/${target_we}.nro)
 endfunction()
 
+message(STATUS "CMAKE_C_FLAGS=${CMAKE_C_FLAGS}")
+message(STATUS "CMAKE_CPP_FLAGS=${CMAKE_CPP_FLAGS}")
+message(STATUS "CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
+message(STATUS "CMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}")
 

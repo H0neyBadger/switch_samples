@@ -14,6 +14,7 @@ add_executable(test WIN32
     main.cpp
 )
 
-target_link_libraries(test drm_nouveau nx m)
+find_library(NOUVEAU drm_nouveau)
+target_link_libraries(test PRIVATE ${NOUVEAU})
 
 add_nro_target(test "cmake" "template" "0.0.1" "${CMAKE_SOURCE_DIR}/icon.jpg" "${CMAKE_SOURCE_DIR}/romfs")
